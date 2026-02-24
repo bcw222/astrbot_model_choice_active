@@ -63,6 +63,12 @@ class RAGWebUIServer:
         if self._server_task and not self._server_task.done():
             return
 
+        logger.info(
+            "enhance-mode | RAG WebUI starting | host=%s port=%s session_timeout=%ss",
+            self.host,
+            self.port,
+            self.session_timeout,
+        )
         config = uvicorn.Config(
             app=self._app,
             host=self.host,
@@ -254,6 +260,10 @@ class RAGWebUIServer:
                 )
 
             if password != self._access_password:
+                logger.warning(
+                    "enhance-mode | RAG WebUI login failed | ip=%s reason=wrong_password",
+                    client_ip,
+                )
                 await self._record_failed_attempt(client_ip)
                 await asyncio.sleep(0.8)
                 raise HTTPException(
@@ -270,6 +280,11 @@ class RAGWebUIServer:
                     "last_active": now_ts,
                     "max_lifetime": 86400.0,
                 }
+            logger.info(
+                "enhance-mode | RAG WebUI login success | ip=%s active_tokens=%s",
+                client_ip,
+                len(self._tokens),
+            )
             return {"token": token, "expires_in": self.session_timeout}
 
         @self._app.post("/api/logout")
@@ -278,6 +293,11 @@ class RAGWebUIServer:
         ) -> dict[str, Any]:
             async with self._token_lock:
                 self._tokens.pop(token, None)
+                active_tokens = len(self._tokens)
+            logger.info(
+                "enhance-mode | RAG WebUI logout | active_tokens=%s",
+                active_tokens,
+            )
             return {"success": True}
 
         @self._app.get("/api/stats")
@@ -334,4 +354,5 @@ class RAGWebUIServer:
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Memory not found.",
                 )
+            logger.info("enhance-mode | RAG WebUI memory deleted | memory_id=%s", memory_id)
             return {"success": True, "message": f"Memory {memory_id} deleted."}

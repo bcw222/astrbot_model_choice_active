@@ -30,7 +30,7 @@
             },
             "image_caption": {
                 "description": "图片转述",
-                "hint": "为群聊中的图片生成文字描述并写入历史。",
+                "hint": "启用按需图片转述能力。历史默认写入 [Image]，模型可通过工具按需补全描述。",
                 "type": "bool",
                 "default": false
             },

@@ -32,7 +32,7 @@
 
 - React 模式（群聊上下文增强总开关）
 - 群聊历史增强（可注入发送者 ID、角色标签、消息编号）
-- 图片转述（可选，调用指定/默认模型生成图片描述）
+- 图片转述（可选，默认记录 `[Image]`，由工具按需生成描述并回填历史）
 - 角色显示（在 system reminder 注入 `admin/member`）
 
 ### Active Reply
@@ -58,6 +58,7 @@
 ### Memory RAG
 
 - LLM Tools:
+  - `enhance_get_image_description`
   - `enhance_memory_rag_write`
   - `enhance_memory_rag_read`
 - Embedding Provider 独立配置（不是聊天模型 Provider）
@@ -116,7 +117,7 @@
 | `max_messages` | int | `300` | 每个会话保留的历史条数 |
 | `include_sender_id` | bool | `true` | 历史中包含发送者 ID |
 | `include_role_tag` | bool | `true` | 历史中包含角色标签 |
-| `image_caption` | bool | `false` | 为图片消息生成文字描述 |
+| `image_caption` | bool | `false` | 启用图片描述能力与按需转述工具（历史默认仍记录为 `[Image]`） |
 | `image_caption_provider_id` | string | `""` | 图片转述提供商 ID，空则默认 |
 | `image_caption_prompt` | string | `"用一句话描述这张图片。"` | 图片转述提示词 |
 
@@ -186,6 +187,16 @@
 `duration` 支持 `s/m/h/d`。
 
 ### Memory RAG Tools
+
+#### `enhance_get_image_description`
+
+用于按需为历史消息中的某张图片生成描述。该工具会尝试把同一条历史中的 `[Image]` 替换为 `[Image: ...]`，便于后续上下文继续使用。
+
+| Param | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `message_id` | string | Yes | - | 要转述的消息 ID（对应历史中的 `#msg...`） |
+| `image_index` | int | No | `1` | 第几张图片（从 `1` 开始） |
+| `prompt` | string | No | `""` | 本次调用覆盖默认图片描述提示词 |
 
 #### `enhance_memory_rag_write`
 

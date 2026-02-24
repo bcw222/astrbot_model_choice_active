@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import json
 import random
+import re
 import time
 import traceback
 import uuid
@@ -32,6 +33,9 @@ from .tag_utils import (
 )
 from .webui import RAGWebUIServer
 
+IMAGE_MARKER_PATTERN = re.compile(r"\[Image(?:: [^\]]*)?\]")
+MSG_ID_PATTERN = re.compile(r"#msg([^:]+):")
+
 
 class Main(star.Star):
     def __init__(self, context: star.Context, config: dict | None = None) -> None:
@@ -51,12 +55,86 @@ class Main(star.Star):
             self.memory_rag_store = MemoryRAGStore(plugin_data_dir / "memory_rag.db")
         except Exception as e:
             logger.error(f"enhance-mode | 初始化记忆 RAG 存储失败: {e}", exc_info=True)
+        logger.info(
+            "enhance-mode | plugin initialized | data_dir=%s memory_rag_store_ready=%s",
+            plugin_data_dir,
+            self.memory_rag_store is not None,
+        )
 
     def _cfg(self) -> PluginConfig:
         return parse_plugin_config(self.config)
 
     def _touch_origin(self, origin: str, cfg: PluginConfig) -> None:
         self.runtime.touch_origin(origin, cfg.global_settings.lru_cache.max_origins)
+
+    @staticmethod
+    def _provider_label(provider: object | None) -> str:
+        if provider is None:
+            return "none"
+        provider_id = getattr(provider, "provider_id", None) or getattr(
+            provider, "id", None
+        )
+        if provider_id:
+            return str(provider_id)
+        model = getattr(provider, "model", None)
+        cls_name = type(provider).__name__
+        return f"{cls_name}({model})" if model else cls_name
+
+    @staticmethod
+    def _normalize_message_id(raw: str | int | None) -> str:
+        text = str(raw or "").strip()
+        if text.startswith("#msg"):
+            text = text[4:]
+        if text.endswith(":"):
+            text = text[:-1]
+        return text.strip()
+
+    @staticmethod
+    def _extract_message_id_from_history_line(line: str) -> str:
+        matched = MSG_ID_PATTERN.search(str(line or ""))
+        if not matched:
+            return ""
+        return str(matched.group(1) or "").strip()
+
+    @staticmethod
+    def _replace_image_marker_at_index(
+        line: str, image_index: int, caption: str
+    ) -> tuple[str, bool]:
+        if image_index < 0:
+            return line, False
+        matches = list(IMAGE_MARKER_PATTERN.finditer(line))
+        if image_index >= len(matches):
+            return line, False
+
+        target = matches[image_index]
+        safe_caption = str(caption or "").strip().replace("]", ")")
+        replacement = f"[Image: {safe_caption}]"
+        new_line = line[: target.start()] + replacement + line[target.end() :]
+        return new_line, new_line != line
+
+    def _apply_image_caption_to_history(
+        self,
+        origin: str,
+        message_id: str,
+        image_index: int,
+        caption: str,
+    ) -> bool:
+        chats = self.runtime.session_chats.get(origin)
+        if not chats:
+            return False
+
+        target_marker = f"#msg{message_id}:"
+        for idx, line in enumerate(chats):
+            if target_marker not in line:
+                continue
+            replaced_line, changed = self._replace_image_marker_at_index(
+                line, image_index, caption
+            )
+            if not changed:
+                return False
+            chats[idx] = replaced_line
+            return True
+        return False
 
     @staticmethod
     def _format_duration(seconds: int) -> str:
@@ -222,6 +300,10 @@ class Main(star.Star):
         if provider_id:
             provider = self.context.get_provider_by_id(provider_id)
             if provider and isinstance(provider, EmbeddingProvider):
+                logger.debug(
+                    "enhance-mode | using configured embedding provider | provider=%s",
+                    self._provider_label(provider),
+                )
                 return provider
             logger.warning(
                 f"enhance-mode | 配置的 embedding_provider_id 无效或类型不匹配: {provider_id}"
@@ -229,6 +311,10 @@ class Main(star.Star):
 
         all_embedding_providers = self.context.get_all_embedding_providers()
         if all_embedding_providers:
+            logger.debug(
+                "enhance-mode | using fallback embedding provider | provider=%s",
+                self._provider_label(all_embedding_providers[0]),
+            )
             return all_embedding_providers[0]
         return None
 
@@ -301,6 +387,16 @@ class Main(star.Star):
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self) -> None:
+        cfg = self._cfg()
+        logger.info(
+            "enhance-mode | loaded | react_mode=%s group_history=%s active_reply=%s memory_rag=%s webui=%s lru_max_origins=%s",
+            cfg.group_features.react_mode_enable,
+            cfg.group_history_enabled,
+            cfg.active_reply_enabled,
+            cfg.memory_rag.enable,
+            cfg.memory_rag_webui.enable,
+            cfg.global_settings.lru_cache.max_origins,
+        )
         await self._start_memory_rag_webui()
 
     def _allow_active_reply(self, event: AstrMessageEvent, cfg: PluginConfig) -> bool:
@@ -536,6 +632,12 @@ class Main(star.Star):
         if not isinstance(provider, Provider):
             raise Exception(f"提供商类型错误({type(provider)})，无法获取图片描述")
 
+        start_ts = time.perf_counter()
+        logger.debug(
+            "enhance-mode | image_caption start | provider=%s timeout=%.1fs",
+            self._provider_label(provider),
+            timeout_sec,
+        )
         response = await asyncio.wait_for(
             provider.text_chat(
                 prompt=prompt,
@@ -544,6 +646,13 @@ class Main(star.Star):
                 persist=False,
             ),
             timeout=timeout_sec,
+        )
+        elapsed_ms = (time.perf_counter() - start_ts) * 1000
+        logger.debug(
+            "enhance-mode | image_caption done | provider=%s elapsed_ms=%.1f caption_len=%s",
+            self._provider_label(provider),
+            elapsed_ms,
+            len(response.completion_text or ""),
         )
         return response.completion_text
 
@@ -556,7 +665,16 @@ class Main(star.Star):
         ar = cfg.active_reply
         if ar.mode == "model_choice":
             return await self._need_active_reply_model_choice(event, cfg)
-        return random.random() < ar.possibility
+        sample = random.random()
+        decision = sample < ar.possibility
+        logger.debug(
+            "enhance-mode | active_reply probability | origin=%s sample=%.4f threshold=%.4f decision=%s",
+            event.unified_msg_origin,
+            sample,
+            ar.possibility,
+            decision,
+        )
+        return decision
 
     @filter.on_llm_request()
     async def inject_role(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
@@ -669,6 +787,12 @@ class Main(star.Star):
                 logger.error("enhance-mode | 未找到任何 LLM 提供商，无法主动回复")
                 return
             try:
+                logger.info(
+                    "enhance-mode | active_reply triggered | origin=%s mode=%s provider=%s",
+                    event.unified_msg_origin,
+                    cfg.active_reply.mode,
+                    self._provider_label(provider),
+                )
                 if hasattr(event, "set_extra"):
                     event.set_extra("_enhance_active_reply_triggered", True)
                     event.set_extra("_enhance_active_reply_mode", cfg.active_reply.mode)
@@ -708,6 +832,8 @@ class Main(star.Star):
         datetime_str = datetime.datetime.now().strftime("%H:%M:%S")
         nickname = event.message_obj.sender.nickname
         msg_id = event.message_obj.message_id
+        normalized_msg_id = self._normalize_message_id(msg_id)
+        image_urls: list[str] = []
 
         if history_cfg.include_sender_id and history_cfg.include_role_tag:
             sender_id = event.get_sender_id()
@@ -727,27 +853,17 @@ class Main(star.Star):
             if isinstance(comp, Reply):
                 quote_nick = comp.sender_nickname or "Unknown"
                 quote_text = (comp.message_str or "").strip() or "..."
-                parts.append(f" [Quote {quote_nick}: {quote_text}]")
+                quote_id = self._normalize_message_id(getattr(comp, "id", ""))
+                if quote_id:
+                    parts.append(f" [Quote #msg{quote_id} {quote_nick}: {quote_text}]")
+                else:
+                    parts.append(f" [Quote {quote_nick}: {quote_text}]")
             elif isinstance(comp, Plain):
                 parts.append(f" {comp.text}")
             elif isinstance(comp, Image):
-                if history_cfg.image_caption:
-                    try:
-                        url = comp.url if comp.url else comp.file
-                        if not url:
-                            raise Exception("图片 URL 为空")
-                        caption = await self._get_image_caption(
-                            url,
-                            history_cfg.image_caption_provider_id,
-                            history_cfg.image_caption_prompt,
-                            cfg.global_settings.timeouts.image_caption_sec,
-                        )
-                        parts.append(f" [Image: {caption}]")
-                    except Exception as e:
-                        logger.exception("enhance-mode | 获取图片描述失败: %s", e)
-                        parts.append(" [Image]")
-                else:
-                    parts.append(" [Image]")
+                image_url = str(comp.url or comp.file or "").strip()
+                image_urls.append(image_url)
+                parts.append(" [Image]")
             elif isinstance(comp, At):
                 parts.append(f" [At: {comp.name}]")
 
@@ -758,7 +874,28 @@ class Main(star.Star):
         chats = self.runtime.session_chats[event.unified_msg_origin]
         chats.append(final_message)
         if len(chats) > history_cfg.max_messages:
-            chats.pop(0)
+            removed_line = chats.pop(0)
+            removed_msg_id = self._extract_message_id_from_history_line(removed_line)
+            if removed_msg_id:
+                self.runtime.image_message_registry[event.unified_msg_origin].pop(
+                    removed_msg_id, None
+                )
+        if normalized_msg_id and image_urls and history_cfg.image_caption:
+            self.runtime.image_message_registry[event.unified_msg_origin][
+                normalized_msg_id
+            ] = {"urls": image_urls, "captions": {}}
+            logger.debug(
+                "enhance-mode | image message registered | origin=%s msg_id=%s image_count=%s deferred_caption=%s",
+                event.unified_msg_origin,
+                normalized_msg_id,
+                len(image_urls),
+                history_cfg.image_caption,
+            )
+        logger.debug(
+            "enhance-mode | group history updated | origin=%s size=%s",
+            event.unified_msg_origin,
+            len(chats),
+        )
 
     @filter.on_llm_request()
     async def inject_group_context(
@@ -774,10 +911,21 @@ class Main(star.Star):
         bounded_chats = bounded_chat_history_text(
             self.runtime.session_chats[event.unified_msg_origin]
         )
+        logger.debug(
+            "enhance-mode | injecting group context | origin=%s history_size=%s",
+            event.unified_msg_origin,
+            len(self.runtime.session_chats[event.unified_msg_origin]),
+        )
         interaction_instructions = build_interaction_instructions(
             cfg.group_features.mention_parse,
             cfg.group_history.include_sender_id,
         )
+        if cfg.group_history.image_caption:
+            interaction_instructions += (
+                "\nIf a history message contains `[Image]` and visual details are necessary, "
+                "you may call `enhance_get_image_description(message_id, image_index)` "
+                "to fetch one image description. Only call this tool when it is needed."
+            )
 
         if (
             cfg.group_features.react_mode_enable
@@ -880,6 +1028,11 @@ class Main(star.Star):
         chats.append(final_message)
         if len(chats) > cfg.group_history.max_messages:
             chats.pop(0)
+        logger.debug(
+            "enhance-mode | bot response recorded | origin=%s size=%s",
+            event.unified_msg_origin,
+            len(chats),
+        )
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent) -> None:
@@ -887,6 +1040,10 @@ class Main(star.Star):
         if not clean_session:
             return
         self.runtime.cleanup_origin(event.unified_msg_origin)
+        logger.info(
+            "enhance-mode | runtime session cache cleaned | origin=%s",
+            event.unified_msg_origin,
+        )
 
     @llm_tool(name="enhance_get_ban_list_status")
     async def get_ban_list_status(
@@ -1025,6 +1182,13 @@ class Main(star.Star):
         expire_time = datetime.datetime.fromtimestamp(expires_at).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
+        logger.info(
+            "enhance-mode | ban applied | scope=%s user_id=%s duration=%s origin=%s",
+            scope_id,
+            target_user_id,
+            self._format_duration(final_duration),
+            event.unified_msg_origin,
+        )
         return (
             f"Banned user `{target_user_id}` in scope `{scope_id}`.\n"
             f"- Duration: {self._format_duration(final_duration)}\n"
@@ -1056,7 +1220,144 @@ class Main(star.Star):
         removed = self.ban_store.unban_user(scope_id=scope_id, user_id=target_user_id)
         if not removed:
             return f"User `{target_user_id}` is not banned in scope `{scope_id}`."
+        logger.info(
+            "enhance-mode | unban applied | scope=%s user_id=%s origin=%s",
+            scope_id,
+            target_user_id,
+            event.unified_msg_origin,
+        )
         return f"Unbanned user `{target_user_id}` in scope `{scope_id}`."
+
+    @llm_tool(name="enhance_get_image_description")
+    async def get_image_description(
+        self,
+        event: AstrMessageEvent,
+        message_id: str,
+        image_index: int = 1,
+        prompt: str = "",
+    ) -> str:
+        """Generate image description for one image in current runtime chat history.
+
+        Args:
+            message_id(string): Required. Message ID in history header, for example `123456`.
+            image_index(number): Optional. One-based index of image in that message. Default is 1.
+            prompt(string): Optional. Override caption prompt for this call.
+        """
+        cfg = self._cfg()
+        if not cfg.group_history_enabled:
+            return "Group history enhancement is disabled in enhance mode config."
+        if not cfg.group_history.image_caption:
+            return "Image caption is disabled in enhance mode config."
+
+        normalized_message_id = self._normalize_message_id(message_id)
+        if not normalized_message_id:
+            return "Invalid `message_id`: empty."
+
+        try:
+            index_number = int(image_index)
+        except (TypeError, ValueError):
+            return "Invalid `image_index`: must be a positive integer."
+        if index_number <= 0:
+            return "Invalid `image_index`: must be >= 1."
+        image_idx = index_number - 1
+
+        origin = event.unified_msg_origin
+        message_registry = self.runtime.image_message_registry.get(origin, {})
+        message_entry = message_registry.get(normalized_message_id)
+        if not isinstance(message_entry, dict):
+            return (
+                f"Image message `{normalized_message_id}` not found in current runtime history. "
+                "Try a newer message ID from current chat context."
+            )
+
+        urls_raw = message_entry.get("urls")
+        if not isinstance(urls_raw, list) or not urls_raw:
+            return f"No image records found for message `{normalized_message_id}`."
+        if image_idx >= len(urls_raw):
+            return (
+                f"`image_index` out of range. message `{normalized_message_id}` has "
+                f"{len(urls_raw)} image(s)."
+            )
+
+        image_url = str(urls_raw[image_idx] or "").strip()
+        if not image_url:
+            return (
+                f"Image URL is unavailable for message `{normalized_message_id}` "
+                f"at index {index_number}."
+            )
+
+        captions_raw = message_entry.get("captions")
+        if isinstance(captions_raw, dict):
+            captions_map = captions_raw
+        else:
+            captions_map = {}
+            message_entry["captions"] = captions_map
+
+        cached_caption = captions_map.get(image_idx)
+        if isinstance(cached_caption, str) and cached_caption.strip():
+            replaced = self._apply_image_caption_to_history(
+                origin=origin,
+                message_id=normalized_message_id,
+                image_index=image_idx,
+                caption=cached_caption,
+            )
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "cached": True,
+                    "origin": origin,
+                    "message_id": normalized_message_id,
+                    "image_index": index_number,
+                    "caption": cached_caption,
+                    "applied_to_history": replaced,
+                },
+                ensure_ascii=False,
+            )
+
+        final_prompt = str(prompt or "").strip() or cfg.group_history.image_caption_prompt
+        try:
+            caption = await self._get_image_caption(
+                image_url=image_url,
+                provider_id=cfg.group_history.image_caption_provider_id,
+                prompt=final_prompt,
+                timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
+            )
+        except Exception as e:
+            logger.exception(
+                "enhance-mode | get_image_description failed | origin=%s msg_id=%s image_index=%s error=%s",
+                origin,
+                normalized_message_id,
+                index_number,
+                e,
+            )
+            return f"Failed to get image description: {e}"
+
+        captions_map[image_idx] = caption
+        replaced = self._apply_image_caption_to_history(
+            origin=origin,
+            message_id=normalized_message_id,
+            image_index=image_idx,
+            caption=caption,
+        )
+        logger.info(
+            "enhance-mode | image description generated | origin=%s msg_id=%s image_index=%s applied_to_history=%s",
+            origin,
+            normalized_message_id,
+            index_number,
+            replaced,
+        )
+        return json.dumps(
+            {
+                "status": "ok",
+                "cached": False,
+                "origin": origin,
+                "message_id": normalized_message_id,
+                "image_index": index_number,
+                "caption": caption,
+                "applied_to_history": replaced,
+            },
+            ensure_ascii=False,
+        )
 
     @llm_tool(name="enhance_memory_rag_write")
     async def memory_rag_write(
@@ -1115,9 +1416,18 @@ class Main(star.Star):
                 "Please configure one in AstrBot provider settings."
             )
 
+        start_ts = time.perf_counter()
+        logger.info(
+            "enhance-mode | memory_rag_write start | origin=%s roles=%s content_len=%s scope=%s",
+            event.unified_msg_origin,
+            len(role_ids),
+            len(clean_content),
+            final_scope,
+        )
         try:
             embedding = await embedding_provider.get_embedding(clean_content)
         except Exception as e:
+            logger.exception("enhance-mode | memory_rag_write embedding failed: %s", e)
             return f"Failed to generate embedding: {e}"
 
         metadata = self._parse_extra_metadata(extra_metadata_json)
@@ -1133,7 +1443,17 @@ class Main(star.Star):
                 extra_metadata=metadata,
             )
         except Exception as e:
+            logger.exception("enhance-mode | memory_rag_write store failed: %s", e)
             return f"Failed to write memory: {e}"
+
+        elapsed_ms = (time.perf_counter() - start_ts) * 1000
+        logger.info(
+            "enhance-mode | memory_rag_write done | memory_id=%s provider=%s embedding_dim=%s elapsed_ms=%.1f",
+            memory_id,
+            self._provider_label(embedding_provider),
+            len(embedding),
+            elapsed_ms,
+        )
 
         return json.dumps(
             {
@@ -1257,6 +1577,17 @@ class Main(star.Star):
 
         query_embedding: list[float] | None = None
         clean_query = str(query or "").strip()
+        start_ts = time.perf_counter()
+        logger.info(
+            "enhance-mode | memory_rag_read start | origin=%s query_len=%s role_count=%s scope=%s max_results=%s sort=%s/%s",
+            event.unified_msg_origin,
+            len(clean_query),
+            len(normalized_roles),
+            final_scope,
+            final_max_results,
+            normalized_sort_by,
+            normalized_sort_order,
+        )
         if clean_query:
             embedding_provider = self._resolve_embedding_provider(cfg)
             if not embedding_provider:
@@ -1267,6 +1598,7 @@ class Main(star.Star):
             try:
                 query_embedding = await embedding_provider.get_embedding(clean_query)
             except Exception as e:
+                logger.exception("enhance-mode | memory_rag_read embedding failed: %s", e)
                 return f"Failed to generate query embedding: {e}"
 
         try:
@@ -1285,7 +1617,16 @@ class Main(star.Star):
                 max_results=final_max_results,
             )
         except Exception as e:
+            logger.exception("enhance-mode | memory_rag_read search failed: %s", e)
             return f"Failed to read memories: {e}"
+
+        elapsed_ms = (time.perf_counter() - start_ts) * 1000
+        logger.info(
+            "enhance-mode | memory_rag_read done | origin=%s result_count=%s elapsed_ms=%.1f",
+            event.unified_msg_origin,
+            len(records),
+            elapsed_ms,
+        )
 
         return json.dumps(
             {
@@ -1321,6 +1662,11 @@ class Main(star.Star):
     ) -> AsyncGenerator[MessageEventResult, None]:
         cfg = self._cfg()
         webui_cfg = cfg.memory_rag_webui
+        logger.info(
+            "enhance-mode | rag-webui command received | origin=%s webui_enable=%s",
+            event.unified_msg_origin,
+            webui_cfg.enable,
+        )
         if not webui_cfg.enable:
             yield event.plain_result(
                 "Memory RAG WebUI is disabled.\n"
@@ -1351,4 +1697,6 @@ class Main(star.Star):
         yield event.plain_result(message)
 
     async def terminate(self) -> None:
+        logger.info("enhance-mode | plugin terminating")
         await self._stop_memory_rag_webui()
+        logger.info("enhance-mode | plugin terminated")
