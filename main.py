@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import datetime
 import json
+import mimetypes
 import random
 import re
 import time
@@ -9,6 +11,8 @@ import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from mcp import types as mcp_types
 
 from astrbot.api import llm_tool, logger, sp, star
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
@@ -19,6 +23,7 @@ from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.core.agent.message import TextPart
 from astrbot.core.provider.provider import EmbeddingProvider
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+from astrbot.core.utils.io import download_image_by_url
 
 from .ban_control import BanStore, parse_duration_seconds
 from .memory_rag_store import MemoryRAGStore
@@ -165,6 +170,40 @@ class Main(star.Star):
             chats[idx] = replaced_line
             return True
         return False
+
+    async def _resolve_image_ref_to_local_path(self, image_ref: str) -> str:
+        clean_ref = str(image_ref or "").strip()
+        if not clean_ref:
+            return ""
+
+        if clean_ref.startswith("file://"):
+            clean_ref = clean_ref[7:]
+
+        candidate = Path(clean_ref)
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+
+        if clean_ref.startswith("http://") or clean_ref.startswith("https://"):
+            downloaded = await download_image_by_url(clean_ref)
+            return str(downloaded or "")
+
+        return ""
+
+    @staticmethod
+    def _encode_image_file(image_path: str) -> tuple[str, str]:
+        path = Path(image_path)
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+
+        raw_bytes = path.read_bytes()
+        if not raw_bytes:
+            raise ValueError(f"Image file is empty: {image_path}")
+
+        mime_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+        if not mime_type.startswith("image/"):
+            mime_type = "image/jpeg"
+        encoded = base64.b64encode(raw_bytes).decode("ascii")
+        return encoded, mime_type
 
     @staticmethod
     def _format_duration(seconds: int) -> str:
@@ -916,7 +955,7 @@ class Main(star.Star):
                 self.runtime.image_message_registry[event.unified_msg_origin].pop(
                     removed_msg_id, None
                 )
-        if normalized_msg_id and image_urls and history_cfg.image_caption:
+        if normalized_msg_id and image_urls:
             self.runtime.image_message_registry[event.unified_msg_origin][
                 normalized_msg_id
             ] = {"urls": image_urls, "captions": {}}
@@ -956,12 +995,13 @@ class Main(star.Star):
             cfg.group_features.mention_parse,
             cfg.group_history.include_sender_id,
         )
-        if cfg.group_history.image_caption:
-            interaction_instructions += (
-                "\nIf a history message contains `[Image]` and visual details are necessary, "
-                "you may call `enhance_get_image_description(message_id, image_index)` "
-                "to fetch one image description. Only call this tool when it is needed."
-            )
+        interaction_instructions += (
+            "\nIf a history message contains `[Image]` and visual details are necessary, "
+            "you may call `enhance_use_image(message_id, image_index, attach_to_model, write_to_history, prompt)`. "
+            "By default it does both: attach image to this run context and write description back into chat history. "
+            "Set `attach_to_model=false` for history-only. "
+            "Set `write_to_history=false` for attach-only."
+        )
 
         if (
             cfg.group_features.react_mode_enable
@@ -1269,63 +1309,93 @@ class Main(star.Star):
         )
         return f"Unbanned user `{target_user_id}` in scope `{scope_id}`."
 
-    @llm_tool(name="enhance_get_image_description")
-    async def get_image_description(
+    @staticmethod
+    def _make_text_tool_result(text: str) -> mcp_types.CallToolResult:
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text=str(text or ""))]
+        )
+
+    @llm_tool(name="enhance_use_image")
+    async def use_image(
         self,
         event: AstrMessageEvent,
         message_id: str,
         image_index: int = 1,
+        attach_to_model: bool = True,
+        write_to_history: bool = True,
         prompt: str = "",
-    ) -> str:
-        """Generate image description for one image in current runtime chat history.
+    ) -> AsyncGenerator[mcp_types.CallToolResult, None]:
+        """Use one image from runtime history for multimodal input and/or history backfill.
 
         Args:
             message_id(string): Required. Message ID in history header, for example `123456`.
             image_index(number): Optional. One-based index of image in that message. Default is 1.
-            prompt(string): Optional. Override caption prompt for this call.
+            attach_to_model(bool): Optional. Attach image bytes to this run context. Default is true.
+            write_to_history(bool): Optional. Replace `[Image]` with description in history. Default is true.
+            prompt(string): Optional. Override image caption prompt for this call.
         """
         cfg = self._cfg()
         if not cfg.group_history_enabled:
-            return "Group history enhancement is disabled in enhance mode config."
-        if not cfg.group_history.image_caption:
-            return "Image caption is disabled in enhance mode config."
+            yield self._make_text_tool_result(
+                "Group history enhancement is disabled in enhance mode config."
+            )
+            return
 
         normalized_message_id = self._normalize_message_id(message_id)
         if not normalized_message_id:
-            return "Invalid `message_id`: empty."
+            yield self._make_text_tool_result("Invalid `message_id`: empty.")
+            return
 
         try:
             index_number = int(image_index)
         except (TypeError, ValueError):
-            return "Invalid `image_index`: must be a positive integer."
+            yield self._make_text_tool_result(
+                "Invalid `image_index`: must be a positive integer."
+            )
+            return
         if index_number <= 0:
-            return "Invalid `image_index`: must be >= 1."
+            yield self._make_text_tool_result("Invalid `image_index`: must be >= 1.")
+            return
         image_idx = index_number - 1
+
+        attach_requested = bool(attach_to_model)
+        history_requested = bool(write_to_history)
+        if not attach_requested and not history_requested:
+            yield self._make_text_tool_result(
+                "Invalid mode: `attach_to_model` and `write_to_history` cannot both be false."
+            )
+            return
 
         origin = event.unified_msg_origin
         message_registry = self.runtime.image_message_registry.get(origin, {})
         message_entry = message_registry.get(normalized_message_id)
         if not isinstance(message_entry, dict):
-            return (
+            yield self._make_text_tool_result(
                 f"Image message `{normalized_message_id}` not found in current runtime history. "
                 "Try a newer message ID from current chat context."
             )
+            return
 
         urls_raw = message_entry.get("urls")
         if not isinstance(urls_raw, list) or not urls_raw:
-            return f"No image records found for message `{normalized_message_id}`."
+            yield self._make_text_tool_result(
+                f"No image records found for message `{normalized_message_id}`."
+            )
+            return
         if image_idx >= len(urls_raw):
-            return (
+            yield self._make_text_tool_result(
                 f"`image_index` out of range. message `{normalized_message_id}` has "
                 f"{len(urls_raw)} image(s)."
             )
+            return
 
         image_url = str(urls_raw[image_idx] or "").strip()
         if not image_url:
-            return (
+            yield self._make_text_tool_result(
                 f"Image URL is unavailable for message `{normalized_message_id}` "
                 f"at index {index_number}."
             )
+            return
 
         captions_raw = message_entry.get("captions")
         if isinstance(captions_raw, dict):
@@ -1334,73 +1404,162 @@ class Main(star.Star):
             captions_map = {}
             message_entry["captions"] = captions_map
 
-        cached_caption = captions_map.get(image_idx)
-        if isinstance(cached_caption, str) and cached_caption.strip():
-            replaced = self._apply_image_caption_to_history(
-                origin=origin,
-                message_id=normalized_message_id,
-                image_index=image_idx,
-                caption=cached_caption,
-            )
-            return json.dumps(
-                {
-                    "status": "ok",
-                    "cached": True,
-                    "origin": origin,
-                    "message_id": normalized_message_id,
-                    "image_index": index_number,
-                    "caption": cached_caption,
-                    "applied_to_history": replaced,
-                },
-                ensure_ascii=False,
-            )
-
-        final_prompt = (
-            str(prompt or "").strip() or cfg.group_history.image_caption_prompt
-        )
+        caption = ""
+        caption_cached = False
         try:
-            caption = await self._get_image_caption(
-                image_url=image_url,
-                provider_id=cfg.group_history.image_caption_provider_id,
-                prompt=final_prompt,
-                timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
-            )
+            cached_caption = captions_map.get(image_idx)
+            if isinstance(cached_caption, str) and cached_caption.strip():
+                caption = cached_caption.strip()
+                caption_cached = True
+            else:
+                if not cfg.group_history.image_caption:
+                    yield self._make_text_tool_result(
+                        "Image caption is disabled in enhance mode config."
+                    )
+                    return
+                final_prompt = (
+                    str(prompt or "").strip() or cfg.group_history.image_caption_prompt
+                )
+                caption = await self._get_image_caption(
+                    image_url=image_url,
+                    provider_id=cfg.group_history.image_caption_provider_id,
+                    prompt=final_prompt,
+                    timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
+                )
+                caption = str(caption or "").strip()
+                if caption:
+                    captions_map[image_idx] = caption
         except Exception as e:
             logger.exception(
-                "enhance-mode | get_image_description failed | origin=%s msg_id=%s image_index=%s error=%s",
+                "enhance-mode | use_image caption failed | origin=%s msg_id=%s image_index=%s error=%s",
                 origin,
                 normalized_message_id,
                 index_number,
                 e,
             )
-            return f"Failed to get image description: {e}"
+            yield self._make_text_tool_result(f"Failed to get image description: {e}")
+            return
 
-        captions_map[image_idx] = caption
-        replaced = self._apply_image_caption_to_history(
-            origin=origin,
-            message_id=normalized_message_id,
-            image_index=image_idx,
-            caption=caption,
-        )
+        attach_success = False
+        attach_error = ""
+        if attach_requested:
+            resolved_paths_raw = message_entry.get("resolved_paths")
+            if not isinstance(resolved_paths_raw, list) or len(
+                resolved_paths_raw
+            ) != len(urls_raw):
+                resolved_paths_raw = [""] * len(urls_raw)
+                message_entry["resolved_paths"] = resolved_paths_raw
+
+            selected_ref = str(
+                resolved_paths_raw[image_idx] or urls_raw[image_idx] or ""
+            ).strip()
+            if not selected_ref:
+                attach_error = (
+                    f"Image reference is unavailable for message `{normalized_message_id}` "
+                    f"at index {index_number}."
+                )
+            else:
+                try:
+                    local_path = await self._resolve_image_ref_to_local_path(
+                        selected_ref
+                    )
+                    if not local_path:
+                        attach_error = (
+                            f"Failed to resolve image path for message `{normalized_message_id}` "
+                            f"index {index_number}."
+                        )
+                    else:
+                        resolved_paths_raw[image_idx] = local_path
+                        image_b64, mime_type = self._encode_image_file(local_path)
+                        yield mcp_types.CallToolResult(
+                            content=[
+                                mcp_types.ImageContent(
+                                    type="image",
+                                    data=image_b64,
+                                    mimeType=mime_type,
+                                )
+                            ]
+                        )
+                        attach_success = True
+                        logger.info(
+                            "enhance-mode | use_image attach success | origin=%s msg_id=%s image_index=%s mime=%s",
+                            origin,
+                            normalized_message_id,
+                            index_number,
+                            mime_type,
+                        )
+                except Exception as e:
+                    attach_error = str(e)
+                    logger.exception(
+                        "enhance-mode | use_image attach failed | origin=%s msg_id=%s image_index=%s error=%s",
+                        origin,
+                        normalized_message_id,
+                        index_number,
+                        e,
+                    )
+
+        history_success = False
+        history_error = ""
+        if history_requested:
+            if not caption:
+                history_error = "Image description is empty."
+            else:
+                history_success = self._apply_image_caption_to_history(
+                    origin=origin,
+                    message_id=normalized_message_id,
+                    image_index=image_idx,
+                    caption=caption,
+                )
+                if history_success:
+                    logger.info(
+                        "enhance-mode | use_image history write success | origin=%s msg_id=%s image_index=%s",
+                        origin,
+                        normalized_message_id,
+                        index_number,
+                    )
+                else:
+                    history_error = (
+                        "Failed to apply image description back to runtime history."
+                    )
+
+        if attach_requested and history_requested:
+            success = attach_success and history_success
+        elif attach_requested:
+            success = attach_success and bool(caption)
+        else:
+            success = history_success
+
+        payload: dict[str, object] = {
+            "status": "ok" if success else "failed",
+            "success": success,
+            "origin": origin,
+            "message_id": normalized_message_id,
+            "image_index": index_number,
+            "attach_requested": attach_requested,
+            "write_to_history_requested": history_requested,
+            "attach_success": attach_success if attach_requested else None,
+            "write_to_history_success": history_success if history_requested else None,
+            "description_cached": caption_cached,
+        }
+        if attach_requested and not history_requested:
+            payload["description"] = caption
+        if attach_error:
+            payload["attach_error"] = attach_error
+        if history_error:
+            payload["write_to_history_error"] = history_error
+
         logger.info(
-            "enhance-mode | image description generated | origin=%s msg_id=%s image_index=%s applied_to_history=%s",
+            "enhance-mode | use_image done | origin=%s msg_id=%s image_index=%s attach=%s/%s write=%s/%s success=%s",
             origin,
             normalized_message_id,
             index_number,
-            replaced,
+            attach_success,
+            attach_requested,
+            history_success,
+            history_requested,
+            success,
         )
-        return json.dumps(
-            {
-                "status": "ok",
-                "cached": False,
-                "origin": origin,
-                "message_id": normalized_message_id,
-                "image_index": index_number,
-                "caption": caption,
-                "applied_to_history": replaced,
-            },
-            ensure_ascii=False,
-        )
+        yield self._make_text_tool_result(json.dumps(payload, ensure_ascii=False))
 
     @llm_tool(name="enhance_memory_rag_write")
     async def memory_rag_write(

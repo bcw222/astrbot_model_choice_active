@@ -7,7 +7,7 @@
 
 ## Update Notes (v0.2.3)
 
-- 新增按需图片描述工具 `enhance_get_image_description`，支持在历史中按消息 ID 回填图片描述。
+- 新增统一图片工具 `enhance_use_image`，可按需将图片塞入本轮上下文并回填历史描述（默认同时执行）。
 - Memory RAG 时间解析/显示统一跟随 AstrBot 全局 `timezone`（默认 `Asia/Shanghai`）。
 - WebUI 新增 Cleanup 功能与 `/api/cleanup`，可将旧记录规范化并回写。
 - 新增插件依赖声明 `requirements.txt`，自动安装 `fastapi`、`uvicorn`，修复安装后缺模块导致加载失败。
@@ -65,7 +65,7 @@
 ### Memory RAG
 
 - LLM Tools:
-  - `enhance_get_image_description`
+  - `enhance_use_image`
   - `enhance_memory_rag_write`
   - `enhance_memory_rag_read`
 - Embedding Provider 独立配置（不是聊天模型 Provider）
@@ -198,14 +198,22 @@
 
 ### Memory RAG Tools
 
-#### `enhance_get_image_description`
+#### `enhance_use_image`
 
-用于按需为历史消息中的某张图片生成描述。该工具会尝试把同一条历史中的 `[Image]` 替换为 `[Image: ...]`，便于后续上下文继续使用。
+统一图片工具：默认同时执行两件事：
+1. 将目标图片作为真实图像输入附加到当前推理上下文（多模态模型可直接看图）
+2. 生成图片描述并回填历史中的 `[Image] -> [Image: ...]`
+
+你也可以按参数关闭其中一项：
+- `attach_to_model=false`：仅回填历史（不塞图）
+- `write_to_history=false`：仅塞图（返回描述，不写历史）
 
 | Param | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `message_id` | string | Yes | - | 要转述的消息 ID（对应历史中的 `#msg...`） |
+| `message_id` | string | Yes | - | 目标图片所在消息 ID（对应历史中的 `#msg...`） |
 | `image_index` | int | No | `1` | 第几张图片（从 `1` 开始） |
+| `attach_to_model` | bool | No | `true` | 是否将图片塞入本轮模型上下文 |
+| `write_to_history` | bool | No | `true` | 是否将描述写回历史 `[Image]` |
 | `prompt` | string | No | `""` | 本次调用覆盖默认图片描述提示词 |
 
 #### `enhance_memory_rag_write`
