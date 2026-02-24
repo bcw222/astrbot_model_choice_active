@@ -1027,7 +1027,12 @@ class Main(star.Star):
         chats = self.runtime.session_chats[event.unified_msg_origin]
         chats.append(final_message)
         if len(chats) > cfg.group_history.max_messages:
-            chats.pop(0)
+            removed_line = chats.pop(0)
+            removed_msg_id = self._extract_message_id_from_history_line(removed_line)
+            if removed_msg_id:
+                self.runtime.image_message_registry[event.unified_msg_origin].pop(
+                    removed_msg_id, None
+                )
         logger.debug(
             "enhance-mode | bot response recorded | origin=%s size=%s",
             event.unified_msg_origin,
@@ -1314,7 +1319,9 @@ class Main(star.Star):
                 ensure_ascii=False,
             )
 
-        final_prompt = str(prompt or "").strip() or cfg.group_history.image_caption_prompt
+        final_prompt = (
+            str(prompt or "").strip() or cfg.group_history.image_caption_prompt
+        )
         try:
             caption = await self._get_image_caption(
                 image_url=image_url,
@@ -1512,19 +1519,23 @@ class Main(star.Star):
         if self.memory_rag_store is None:
             return "Memory RAG store is not initialized."
 
-        start_ts = self._parse_optional_timestamp(start_time)
-        end_ts = self._parse_optional_timestamp(end_time)
-        if start_time and start_ts is None:
+        start_time_ts = self._parse_optional_timestamp(start_time)
+        end_time_ts = self._parse_optional_timestamp(end_time)
+        if start_time and start_time_ts is None:
             return (
                 "Invalid `start_time`. Use unix timestamp or ISO datetime "
                 "(for example `1735689600` or `2026-01-01 12:00:00`)."
             )
-        if end_time and end_ts is None:
+        if end_time and end_time_ts is None:
             return (
                 "Invalid `end_time`. Use unix timestamp or ISO datetime "
                 "(for example `1735689600` or `2026-01-01 12:00:00`)."
             )
-        if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        if (
+            start_time_ts is not None
+            and end_time_ts is not None
+            and start_time_ts > end_time_ts
+        ):
             return "Invalid time range: `start_time` cannot be greater than `end_time`."
 
         normalized_ignore_group = (
@@ -1577,7 +1588,7 @@ class Main(star.Star):
 
         query_embedding: list[float] | None = None
         clean_query = str(query or "").strip()
-        start_ts = time.perf_counter()
+        read_start_ts = time.perf_counter()
         logger.info(
             "enhance-mode | memory_rag_read start | origin=%s query_len=%s role_count=%s scope=%s max_results=%s sort=%s/%s",
             event.unified_msg_origin,
@@ -1598,7 +1609,9 @@ class Main(star.Star):
             try:
                 query_embedding = await embedding_provider.get_embedding(clean_query)
             except Exception as e:
-                logger.exception("enhance-mode | memory_rag_read embedding failed: %s", e)
+                logger.exception(
+                    "enhance-mode | memory_rag_read embedding failed: %s", e
+                )
                 return f"Failed to generate query embedding: {e}"
 
         try:
@@ -1610,8 +1623,8 @@ class Main(star.Star):
                 group_scope=final_scope,
                 group_id=final_group_id,
                 platform_id=final_platform_id,
-                start_time=start_ts,
-                end_time=end_ts,
+                start_time=start_time_ts,
+                end_time=end_time_ts,
                 sort_by=normalized_sort_by,
                 sort_order=normalized_sort_order,
                 max_results=final_max_results,
@@ -1620,7 +1633,7 @@ class Main(star.Star):
             logger.exception("enhance-mode | memory_rag_read search failed: %s", e)
             return f"Failed to read memories: {e}"
 
-        elapsed_ms = (time.perf_counter() - start_ts) * 1000
+        elapsed_ms = (time.perf_counter() - read_start_ts) * 1000
         logger.info(
             "enhance-mode | memory_rag_read done | origin=%s result_count=%s elapsed_ms=%.1f",
             event.unified_msg_origin,
@@ -1636,8 +1649,8 @@ class Main(star.Star):
                 "filters": {
                     "related_role_ids": normalized_roles,
                     "role_match_mode": normalized_mode,
-                    "start_time": start_ts,
-                    "end_time": end_ts,
+                    "start_time": start_time_ts,
+                    "end_time": end_time_ts,
                     "ignore_group_id": normalized_ignore_group,
                     "group_scope": final_scope,
                     "group_id": final_group_id,

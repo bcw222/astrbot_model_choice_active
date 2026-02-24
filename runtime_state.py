@@ -6,7 +6,9 @@ class RuntimeState:
         self.session_chats: dict[str, list[str]] = defaultdict(list)
         self.active_reply_stacks: dict[str, list[str]] = defaultdict(list)
         self.model_choice_histories: dict[str, list[str]] = defaultdict(list)
-        self.image_message_registry: dict[str, dict[str, dict[str, object]]] = defaultdict(dict)
+        self.image_message_registry: dict[str, dict[str, dict[str, object]]] = (
+            defaultdict(dict)
+        )
         self.origin_lru: OrderedDict[str, None] = OrderedDict()
 
     def _evict_origin_state(self, origin: str) -> None:

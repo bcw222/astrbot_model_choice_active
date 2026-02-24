@@ -354,5 +354,7 @@ class RAGWebUIServer:
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Memory not found.",
                 )
-            logger.info("enhance-mode | RAG WebUI memory deleted | memory_id=%s", memory_id)
+            logger.info(
+                "enhance-mode | RAG WebUI memory deleted | memory_id=%s", memory_id
+            )
             return {"success": True, "message": f"Memory {memory_id} deleted."}
