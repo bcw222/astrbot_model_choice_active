@@ -1,16 +1,15 @@
 # AstrBot Enhance Mode
 
-**Version**: `v0.2.3`  
+**Version**: `v0.2.4`  
 **Author**: `阿汐`
 
 `astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG 与可视化 WebUI。
 
-## Update Notes (v0.2.3)
+## Update Notes (v0.2.4)
 
-- 新增统一图片工具 `enhance_use_image`，可按需将图片塞入本轮上下文并回填历史描述（默认同时执行）。
-- Memory RAG 时间解析/显示统一跟随 AstrBot 全局 `timezone`（默认 `Asia/Shanghai`）。
-- WebUI 新增 Cleanup 功能与 `/api/cleanup`，可将旧记录规范化并回写。
-- 新增插件依赖声明 `requirements.txt`，自动安装 `fastapi`、`uvicorn`，修复安装后缺模块导致加载失败。
+- 主动回复 `model_choice` 新增独立模型配置：`active_reply.model_choice_provider_id`。
+- 当配置的 `model_choice_provider_id` 无效时，自动回退到当前会话默认 Provider，并输出告警日志。
+- 配置 schema 与文档已同步，WebUI 可直接选择该 Provider。
 
 ## Design Philosophy
 
@@ -140,6 +139,7 @@
 | `possibility` | float | `0.1` | 概率触发时生效 |
 | `model_stack_size` | int | `8` | `model_choice` 栈长度 |
 | `model_history_messages` | int | `0` | `model_choice` 额外历史条数 |
+| `model_choice_provider_id` | string | `""` | `model_choice` 判定模型的提供商 ID，空则使用当前会话默认提供商 |
 | `model_choice_prompt` | string | schema 默认值 | 判定提示词，支持占位符 |
 | `whitelist` | string | `""` | 逗号分隔来源/群号白名单 |
 

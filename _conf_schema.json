@@ -84,6 +84,13 @@
                 "type": "int",
                 "default": 0
             },
+            "model_choice_provider_id": {
+                "description": "模型判定提供商 ID",
+                "hint": "当 mode=model_choice 时生效。用于“是否主动回复”判定，留空使用当前会话默认提供商。",
+                "type": "string",
+                "_special": "select_provider",
+                "default": ""
+            },
             "model_choice_prompt": {
                 "description": "模型判定提示词",
                 "hint": "可使用 {stack_size}、{messages}、{history_count}、{history_context}、{persona_name}、{persona_mask} 占位符，模型需只输出 REPLY 或 SKIP。",

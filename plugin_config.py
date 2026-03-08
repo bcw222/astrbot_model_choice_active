@@ -84,6 +84,7 @@ class ActiveReplyConfig:
     possibility: float = 0.1
     model_stack_size: int = 8
     model_history_messages: int = 0
+    model_choice_provider_id: str = ""
     model_choice_prompt: str = DEFAULT_MODEL_CHOICE_PROMPT
     whitelist: list[str] = field(default_factory=list)
 
@@ -197,6 +198,9 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         model_history_messages=max(
             0, _to_int(active_reply_raw.get("model_history_messages"), 0)
         ),
+        model_choice_provider_id=str(
+            active_reply_raw.get("model_choice_provider_id") or ""
+        ).strip(),
         model_choice_prompt=str(
             active_reply_raw.get("model_choice_prompt") or DEFAULT_MODEL_CHOICE_PROMPT
         ),

@@ -22,7 +22,7 @@ class RAGWebUIServer:
         self,
         store: MemoryRAGStore,
         config: dict[str, Any],
-        plugin_version: str = "0.1.0",
+        plugin_version: str = "0.2.4",
     ) -> None:
         self.store = store
         self.config = config

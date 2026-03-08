@@ -10,6 +10,7 @@ def test_parse_plugin_config_defaults() -> None:
     assert cfg.group_history.enable is False
     assert cfg.active_reply.enable is False
     assert cfg.active_reply.mode == "probability"
+    assert cfg.active_reply.model_choice_provider_id == ""
     assert math.isclose(cfg.active_reply.possibility, 0.1)
     assert cfg.group_history_enabled is False
     assert cfg.active_reply_enabled is False
@@ -39,6 +40,7 @@ def test_active_reply_mode_and_limits_are_normalized() -> None:
                 "mode": "something_else",
                 "model_stack_size": 0,
                 "model_history_messages": -99,
+                "model_choice_provider_id": "  provider-1  ",
                 "whitelist": "a,b, c",
             },
             "global_settings": {
@@ -51,6 +53,7 @@ def test_active_reply_mode_and_limits_are_normalized() -> None:
     assert cfg.active_reply.mode == "probability"
     assert cfg.active_reply.model_stack_size == 1
     assert cfg.active_reply.model_history_messages == 0
+    assert cfg.active_reply.model_choice_provider_id == "provider-1"
     assert cfg.active_reply.whitelist == ["a", "b", "c"]
     assert cfg.global_settings.lru_cache.max_origins == 1
     assert math.isclose(cfg.global_settings.timeouts.image_caption_sec, 45.0)

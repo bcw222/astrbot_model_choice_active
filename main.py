@@ -426,7 +426,7 @@ class Main(star.Star):
                     "access_password": webui_cfg.access_password,
                     "session_timeout": webui_cfg.session_timeout,
                 },
-                plugin_version="0.1.0",
+                plugin_version="0.2.4",
             )
             await self.rag_webui_server.start()
             logger.info(
@@ -557,6 +557,32 @@ class Main(star.Star):
             persona_prompt = "You are a helpful and friendly assistant."
         return persona_name, persona_prompt
 
+    def _resolve_model_choice_provider(
+        self, event: AstrMessageEvent, cfg: PluginConfig
+    ) -> Provider | None:
+        provider_id = str(cfg.active_reply.model_choice_provider_id or "").strip()
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
+            if provider and isinstance(provider, Provider):
+                logger.debug(
+                    "enhance-mode | model_choice provider from config | provider=%s",
+                    self._provider_label(provider),
+                )
+                return provider
+            logger.warning(
+                "enhance-mode | 配置的 model_choice_provider_id 无效或类型不匹配: %s",
+                provider_id,
+            )
+
+        provider = self.context.get_using_provider(event.unified_msg_origin)
+        if provider and isinstance(provider, Provider):
+            logger.debug(
+                "enhance-mode | model_choice provider fallback to current | provider=%s",
+                self._provider_label(provider),
+            )
+            return provider
+        return None
+
     async def _judge_model_choice(
         self,
         event: AstrMessageEvent,
@@ -582,8 +608,8 @@ class Main(star.Star):
             f"history={len(history_context_lines)}"
         )
 
-        provider = self.context.get_using_provider(event.unified_msg_origin)
-        if not provider or not isinstance(provider, Provider):
+        provider = self._resolve_model_choice_provider(event, cfg)
+        if not provider:
             logger.error("enhance-mode | 未找到可用提供商，无法执行模型选择触发")
             return False
 
